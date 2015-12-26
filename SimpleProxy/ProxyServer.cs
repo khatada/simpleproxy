@@ -14,8 +14,6 @@ namespace SimpleProxy
 {
     public class ProxyServer
     {
-        // private static readonly ProxyServer _server = new ProxyServer();
-
         private static readonly int BUFFER_SIZE = 8192;
         private static readonly char[] semiSplit = new char[] { ';' };
         private static readonly char[] equalSplit = new char[] { '=' };
@@ -23,46 +21,36 @@ namespace SimpleProxy
         private static readonly char[] spaceSplit = new char[] { ' ' };
         private static readonly char[] commaSplit = new char[] { ',' };
         private static readonly Regex cookieSplitRegEx = new Regex(@",(?! )");
-        // private static X509Certificate2 _certificate;
-        private static object _outputLockObj = new object();
-
         private static readonly byte[] ChunkTrail = Encoding.ASCII.GetBytes(Environment.NewLine);
-        private static readonly byte[] ChunkEnd =
-            Encoding.ASCII.GetBytes(0.ToString("x2") + Environment.NewLine + Environment.NewLine);
+        private static readonly byte[] ChunkEnd = Encoding.ASCII.GetBytes(0.ToString("x2") + Environment.NewLine + Environment.NewLine);
 
 
-        private TcpListener _listener;
-        private Thread _listenerThread;
-        // private Thread _cacheMaintenanceThread;
+        private TcpListener tcpListener;
+        private Task listenerTask;
+        private CancellationTokenSource listenerTaskCancel;
 
         public IPAddress ListeningIPInterface
         {
             get
             {
                 IPAddress addr = IPAddress.Loopback;
-                //if (ConfigurationManager.AppSettings["ListeningIPInterface"] != null)
-                //    IPAddress.TryParse(ConfigurationManager.AppSettings["ListeningIPInterface"], out addr);
-
                 return addr;
             }
         }
 
-        public Int32 ListeningPort
+        public int ListeningPort
         {
             get
             {
-                Int32 port = 8081;
-                //if (ConfigurationManager.AppSettings["ListeningPort"] != null)
-                //    Int32.TryParse(ConfigurationManager.AppSettings["ListeningPort"], out port);
-
+                var port = 8081;
                 return port;
             }
         }
 
         public ProxyServer()
         {
-            _listener = new TcpListener(ListeningIPInterface, ListeningPort);
-            ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
+            tcpListener = new TcpListener(ListeningIPInterface, ListeningPort);
+            // ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
         }
 
         public Boolean DumpHeaders { get; set; }
@@ -79,18 +67,7 @@ namespace SimpleProxy
         {
             try
             {
-                String certFilePath = String.Empty;
-                //if (ConfigurationManager.AppSettings["CertificateFile"] != null)
-                //    certFilePath = ConfigurationManager.AppSettings["CertificateFile"];
-                //try
-                //{
-                //    _certificate = new X509Certificate2(certFilePath);
-                //}
-                //catch (Exception ex)
-                //{
-                //    throw new ConfigurationErrorsException(String.Format("Could not create the certificate from file from {0}", certFilePath), ex);
-                //}
-                _listener.Start();
+                tcpListener.Start();
             }
             catch (Exception ex)
             {
@@ -98,30 +75,24 @@ namespace SimpleProxy
                 return false;
             }
 
-            _listenerThread = new Thread(new ParameterizedThreadStart(Listen));
-            //_cacheMaintenanceThread = new Thread(new ThreadStart(ProxyCache.CacheMaintenance));
-
-            var param = new ListenerThreadStartParam()
-            {
-                listner = _listener,
-                self = this
-            };
-            _listenerThread.Start(param);
-            // _cacheMaintenanceThread.Start();
+            listenerTaskCancel = new CancellationTokenSource();
+            listenerTask = Task.Factory.StartNew(() => {
+                Listen(this);
+            }, listenerTaskCancel.Token);
 
             return true;
         }
 
         public void Stop()
         {
-            _listener.Stop();
+            tcpListener.Stop();
 
-            //wait for server to finish processing current connections...
-
-            _listenerThread.Abort();
-            // _cacheMaintenanceThread.Abort();
-            _listenerThread.Join();
-            _listenerThread.Join();
+            listenerTaskCancel.Cancel();
+            listenerTask.Wait();
+            listenerTask.Dispose();
+            listenerTask = null;
+            listenerTaskCancel.Dispose();
+            listenerTaskCancel = null;
         }
 
         class ProxyClient
@@ -132,38 +103,44 @@ namespace SimpleProxy
 
         private static void Listen(Object obj)
         {
-            System.Console.WriteLine("start listen thread");
-            var param = (ListenerThreadStartParam)obj;
-            TcpListener listener = param.listner;
-            var proxyServer = param.self;
+            var self = (ProxyServer)obj;
+            TcpListener listener = self.tcpListener;
+            var taskFactory = new TaskFactory();
+
+            System.Console.WriteLine("Listen Start");
             try
             {
                 while (true)
                 {
-                    TcpClient client = listener.AcceptTcpClient();
-                    var proxyProccessingClient = new ProxyClient()
+                    if (self.listenerTaskCancel.Token.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    var client = listener.AcceptTcpClient();
+
+                    var param = new ProxyClient()
                     {
                         tcpClient = client,
-                        self = proxyServer
+                        self = self
                     };
-                    System.Console.WriteLine("connected");
-                    while (!ThreadPool.QueueUserWorkItem(new WaitCallback(ProxyServer.ProcessClient), proxyProccessingClient)) ;
+                    taskFactory.StartNew(ProcessClient, param, self.listenerTaskCancel.Token);
                 }
             }
-            catch (ThreadAbortException) { }
-            catch (SocketException) { }
+            catch (SocketException) {
+            }
         }
-
 
         private static void ProcessClient(Object obj)
         {
             ProxyClient client = (ProxyClient)obj;
             try
             {
-                client.self.DoHttpProcessing(client.tcpClient);
+                System.Console.WriteLine("connection");
+                RequestHandler.processHttp(client.tcpClient);
             }
             catch (Exception ex)
             {
+                Console.WriteLine("Unhandled Exception");
                 Console.WriteLine(ex.Message);
             }
             finally
@@ -172,20 +149,12 @@ namespace SimpleProxy
             }
         }
 
-        private void DoHttpProcessing(TcpClient client)
+        #region deprecated
+        private void ProcessHttp(TcpClient client)
         {
             Stream clientStream = client.GetStream();
-            Stream outStream = clientStream; //use this stream for writing out - may change if we use ssl
-            // SslStream sslStream = null;
+            Stream outStream = clientStream;
             StreamReader clientStreamReader = new StreamReader(clientStream);
-            // CacheEntry cacheEntry = null;
-            MemoryStream cacheStream = null;
-
-            if (this.DumpHeaders || this.DumpPostData || this.DumpResponseData)
-            {
-                //make sure that things print out in order - NOTE: this is bad for performance
-                //Monitor.TryEnter(_outputLockObj, TimeSpan.FromMilliseconds(-1.0));
-            }
 
             try
             {
@@ -652,11 +621,10 @@ namespace SimpleProxy
                 //if (sslStream != null)
                 //    sslStream.Close();
                 outStream.Close();
-                if (cacheStream != null)
-                    cacheStream.Close();
             }
 
         }
+        #endregion
 
         private static List<Tuple<String, String>> ProcessResponse(HttpWebResponse response)
         {
