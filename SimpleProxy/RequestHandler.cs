@@ -92,8 +92,8 @@ namespace SimpleProxy
                 webRequest.Method = method;
                 webRequest.ProtocolVersion = version;
                 webRequest.Proxy = null;
-                webRequest.KeepAlive = false;
-                webRequest.AllowAutoRedirect = true;
+                webRequest.KeepAlive = true;
+                webRequest.AllowAutoRedirect = false;
                 webRequest.AutomaticDecompression = DecompressionMethods.None;
                 webRequest.Timeout = 15000;
 
@@ -250,8 +250,10 @@ namespace SimpleProxy
                     clientStream.Flush();
                     responseStream.Close();
                     response.Close();
+                    response.Dispose();
                     responseWriter.Close();
                     clientStream.Close();
+
                 }
                 catch (Exception ex)
                 {
