@@ -50,7 +50,8 @@ namespace SimpleProxy
         public ProxyServer()
         {
             tcpListener = new TcpListener(ListeningIPInterface, ListeningPort);
-            ServicePointManager.DefaultConnectionLimit = ServicePointManager.DefaultPersistentConnectionLimit;
+            // ServicePointManager.DefaultConnectionLimit = ServicePointManager.DefaultPersistentConnectionLimit;
+            ServicePointManager.DefaultConnectionLimit = 6;
             // ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
         }
 
@@ -136,7 +137,6 @@ namespace SimpleProxy
             ProxyClient client = (ProxyClient)obj;
             try
             {
-                System.Console.WriteLine("connection");
                 RequestHandler.processHttp(client.tcpClient);
             }
             catch (Exception ex)

@@ -24,7 +24,7 @@ namespace SimpleProxy
         public static void processHttp(TcpClient client)
         {
             var handle = client.Client.Handle;
-            System.Console.WriteLine("Socket: " + handle.ToString());
+            // System.Console.WriteLine("Socket: " + handle.ToString());
             
             var clientStream = client.GetStream();
             var clientStreamReader = new StreamReader(clientStream);
@@ -47,6 +47,10 @@ namespace SimpleProxy
                 {
                     HandleConnectCmd(client, clientStream, clientStreamReader, remoteUri);
                 }
+                catch
+                {
+
+                }
                 finally
                 {
                     clientStreamReader.Dispose();
@@ -61,6 +65,10 @@ namespace SimpleProxy
                 try
                 {
                     HandleCmd(client, clientStream, clientStreamReader, httpCmd);
+                }
+                catch
+                {
+
                 }
                 finally
                 {
@@ -114,11 +122,11 @@ namespace SimpleProxy
 
                     foreach (var tuple in hostMap)
                     {
-                        System.Console.WriteLine(string.Format("{0} : {1}", tuple.Value.Count, tuple.Key));
+                        // System.Console.WriteLine(string.Format("{0} : {1}", tuple.Value.Count, tuple.Key));
                     }
                 }
 
-                System.Console.WriteLine(httpCmd);
+                // System.Console.WriteLine(httpCmd);
                 // System.Console.WriteLine(requestHeaders.Print());
 
 
@@ -130,7 +138,7 @@ namespace SimpleProxy
                 webRequest.ProtocolVersion = version;
                 webRequest.Proxy = null;
                 webRequest.KeepAlive = keepAlive;
-                System.Console.WriteLine("Request Connection KeepAlive: " + keepAlive.ToString());
+                // System.Console.WriteLine("Request Connection KeepAlive: " + keepAlive.ToString());
                 webRequest.AllowAutoRedirect = false;
                 webRequest.AutomaticDecompression = DecompressionMethods.None;
                 webRequest.Timeout = 10000;
@@ -203,8 +211,7 @@ namespace SimpleProxy
                 {
                     keepConnection = true;
                 }
-                System.Console.WriteLine("Connection " + responseConnection + " " + keepConnection.ToString());
-
+                // System.Console.WriteLine("Connection " + responseConnection + " " + keepConnection.ToString());
                 // System.Console.WriteLine(responseHeaders.Print());
 
                 responseStream = response.GetResponseStream();
@@ -218,7 +225,7 @@ namespace SimpleProxy
                     responseWriter = new StreamWriter(clientStream);
                     var status = string.Format("HTTP/1.1 {0} {1}", (Int32)response.StatusCode, response.StatusDescription);
                     responseWriter.WriteLine(status);
-                    System.Console.WriteLine(status);
+                    // System.Console.WriteLine(status);
 
                     foreach (var header in responseHeaders)
                     {
@@ -333,7 +340,7 @@ namespace SimpleProxy
                 if (keepConnection)
                 {
                     var nexthttpCmd = clientStreamReader.ReadLine();
-                    System.Console.WriteLine("next: " + nexthttpCmd);
+                    // System.Console.WriteLine("next: " + nexthttpCmd);
                     if (!string.IsNullOrEmpty(nexthttpCmd))
                     {
                         HandleCmd(client, clientStream, clientStreamReader, nexthttpCmd);
@@ -355,11 +362,11 @@ namespace SimpleProxy
             var data = clientStreamReader.ReadLine();
             while (!string.IsNullOrEmpty(data))
             {
-                System.Console.WriteLine(data);
+                // System.Console.WriteLine(data);
                 data = clientStreamReader.ReadLine();
             }
 
-            System.Console.WriteLine("Tunnel: " + host + ":" + port.ToString());
+            // System.Console.WriteLine("Tunnel: " + host + ":" + port.ToString());
 
             // connect to host synchronously
             var tunnelClient = new TcpClient(host, port);
@@ -378,7 +385,7 @@ namespace SimpleProxy
 
             var tunnelStream = tunnelClient.GetStream();
 
-            System.Console.WriteLine("tunnel start");
+            // System.Console.WriteLine("tunnel start");
             var relayToServer = Task.Factory.StartNew(() =>
             {
                 try
@@ -514,7 +521,7 @@ namespace SimpleProxy
                 }
                 waitCancell.Cancel();
 
-                System.Console.WriteLine("tunnel close (by client close) " + host);
+                // System.Console.WriteLine("tunnel close (by client close) " + host);
                 try
                 {
                     if (tunnelStream != null)
@@ -544,7 +551,7 @@ namespace SimpleProxy
                     }
                     waitCancell.Cancel();
 
-                    System.Console.WriteLine("tunnel close (by timeout) " + host);
+                    // System.Console.WriteLine("tunnel close (by timeout) " + host);
 
                     try
                     {
