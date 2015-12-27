@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -18,13 +19,13 @@ namespace SimpleProxy
         private static readonly byte[] chunkEnd = Encoding.ASCII.GetBytes(0.ToString("x2") + Environment.NewLine + Environment.NewLine);
 
 
+        public static IDictionary<string, IList<int>> hostMap = new Dictionary<string, IList<int>>();
+
         public static void processHttp(TcpClient client)
         {
             bool keep = false;
             var clientStream = client.GetStream();
             var clientStreamReader = new StreamReader(clientStream);
-
-            System.Console.WriteLine("aaa");
 
             var httpCmd = clientStreamReader.ReadLine();
             if (string.IsNullOrEmpty(httpCmd))
@@ -57,87 +58,117 @@ namespace SimpleProxy
 
             // read request header
             var requestHeaders = HttpUtil.ReadHeaders(clientStreamReader);
-            var contentLength = requestHeaders.getAsIntOrElse("content-length",0);
+            var contentLength = requestHeaders.getAsIntOrElse("content-length", 0);
 
-            var webRequest = (HttpWebRequest)HttpWebRequest.Create(remoteUri);
-            webRequest.Method = method;
-            webRequest.ProtocolVersion = version;
-            requestHeaders.ApplyTo(webRequest);
+            var url = new Uri(remoteUri);
 
-            // override headers
-            webRequest.Proxy = null;
-            webRequest.KeepAlive = false;
-            webRequest.AllowAutoRedirect = true;
-            webRequest.AutomaticDecompression = DecompressionMethods.None;
-            webRequest.Timeout = 15000;
-
-            System.Console.WriteLine(requestHeaders.Print());
-
-            if (method == "GET")
+            try
             {
-
-            }
-            else if (method == "POST")
-            {
-                char[] postBuffer = new char[contentLength];
-                int total= 0;
-                var requestWriter = new StreamWriter(webRequest.GetRequestStream());
-
-                while(true)
+                IList<int> clientList = null;
+                lock (hostMap)
                 {
-                    if (total >= contentLength)
+                    hostMap.TryGetValue(url.Host, out clientList);
+                    if (clientList == null)
                     {
-                        break;
+                        clientList = new List<int>();
+                        hostMap.Add(url.Host, clientList);
                     }
-                    var count = clientStreamReader.ReadBlock(postBuffer, 0, contentLength);
-                    if(count <= 0)
-                    {
-                        break;
-                    }
+                    clientList.Add(client.GetHashCode());
 
-                    total += count;
-                    requestWriter.Write(postBuffer, 0, count);
+                    foreach(var tuple in hostMap)
+                    {
+                        System.Console.WriteLine(string.Format("{0} : {1}", tuple.Value.Count, tuple.Key));
+                    }
                 }
 
-                requestWriter.Close();
-            }
-            else
-            {
-                System.Console.WriteLine("Error while reuqest to " + remoteUri);
-                System.Console.WriteLine("Unrecognized method " + method.ToUpper());
-            }
+                System.Console.WriteLine(httpCmd);
+                // System.Console.WriteLine(requestHeaders.Print());
 
-            HttpWebResponse response = null;
-            try
-            {
-                response = (HttpWebResponse)webRequest.GetResponse();
-            }
-            catch (WebException webEx)
-            {
-                response = webEx.Response as HttpWebResponse;
-            }
-            catch (Exception ex)
-            {
-                System.Console.WriteLine("Error while receiving resopnse");
-                System.Console.WriteLine(ex.Message);
-            }
 
-            if (response == null)
-            {
-                clientStreamReader.Dispose();
-                clientStream.Dispose();
-                client.Close();
-                return;
-            }
+                var webRequest = (HttpWebRequest)HttpWebRequest.Create(remoteUri);
+                requestHeaders.ApplyTo(webRequest);
 
-            var responseHeaders = HttpUtil.ReadHeaders(response);
-            responseHeaders.Add(new Tuple<string, string>("X-Proxied-By", "simple-proxy"));
+                // override headers
+                webRequest.Method = method;
+                webRequest.ProtocolVersion = version;
+                webRequest.Proxy = null;
+                webRequest.KeepAlive = false;
+                webRequest.AllowAutoRedirect = true;
+                webRequest.AutomaticDecompression = DecompressionMethods.None;
+                webRequest.Timeout = 15000;
 
-            System.Console.WriteLine(responseHeaders.Print());
+                if (method == "GET")
+                {
 
-            var responseStream = response.GetResponseStream();
-            try
-            {
+                }
+                else if (method == "POST")
+                {
+                    var postBuffer = new char[contentLength];
+                    int total = 0;
+                    var requestWriter = new StreamWriter(webRequest.GetRequestStream());
+
+                    while (true)
+                    {
+                        if (total >= contentLength)
+                        {
+                            break;
+                        }
+
+                        // clientStream.Read does not read data and blocks forever
+                        //var count = clientStream.Read(postBuffer, 0, contentLength);
+                        var count = clientStreamReader.ReadBlock(postBuffer, 0, contentLength);
+                        if (count <= 0)
+                        {
+                            break;
+                        }
+
+                        total += count;
+                        requestWriter.Write(postBuffer, 0, count);
+                    }
+                    requestWriter.Flush();
+                }
+                else
+                {
+                    System.Console.WriteLine("Error while reuqest to " + remoteUri);
+                    System.Console.WriteLine("Unrecognized method " + method.ToUpper());
+                }
+
+                HttpWebResponse response = null;
+                try
+                {
+                    response = (HttpWebResponse)webRequest.GetResponse();
+                }
+                catch (WebException webEx)
+                {
+                    response = webEx.Response as HttpWebResponse;
+                }
+                catch (Exception ex)
+                {
+                    System.Console.WriteLine("Error while receiving resopnse");
+                    System.Console.WriteLine(ex.Message);
+                }
+
+                if (response == null)
+                {
+                    clientStreamReader.Dispose();
+                    clientStream.Dispose();
+                    client.Close();
+                    return;
+                }
+
+                var responseHeaders = HttpUtil.ReadHeaders(response);
+                responseHeaders.Add(new Tuple<string, string>("X-Proxied-By", "simple-proxy"));
+
+                var responseConnection = responseHeaders.getAsStringOrElse("connection", "");
+                if (responseConnection.ToLower() == "keep-alive")
+                {
+                    keep = true;
+                }
+
+                // System.Console.WriteLine(responseHeaders.Print());
+                
+                var responseStream = response.GetResponseStream();
+
                 Task writeTask = null;
                 // When StreamWriter is closed, clientStream is also closed.
                 StreamWriter responseWriter = null;
@@ -163,26 +194,7 @@ namespace SimpleProxy
                 }
 
                 Task serverWriteTask = null;
-                
-                if (responseHeaders.getAsStringOrElse("WWW-Authenticate", "").Contains("NTLM"))
-                {
-                    keep = true;
-                    //serverWriteTask = clientStream.CopyToAsync(response.GetResponseStream())
-                    //        .ContinueWith((t) =>
-                    //        {
-                    //            System.Console.WriteLine("servver send ends");
-                    //        });
-                }
 
-                //var connectionHeader = responseHeaders.FirstOrDefault((header) => header.Item1 == "Connection");
-                //if (connectionHeader != null)
-                //{
-                //    System.Console.WriteLine(connectionHeader.Item1 + ": " + connectionHeader.Item2);
-                //}
-                //else
-                //{
-                //    System.Console.WriteLine("Connection: (null)");
-                //}
 
                 Byte[] buffer;
                 if (response.ContentLength > 0)
@@ -228,17 +240,17 @@ namespace SimpleProxy
                     writeTask.Wait();
                 }
 
-                if(serverWriteTask != null && !serverWriteTask.IsCompleted)
+                if (serverWriteTask != null && !serverWriteTask.IsCompleted)
                 {
                     serverWriteTask.Wait();
                 }
 
                 try
                 {
+                    clientStream.Flush();
                     responseStream.Close();
                     response.Close();
                     responseWriter.Close();
-                    clientStream.Flush();
                     clientStream.Close();
                 }
                 catch (Exception ex)
@@ -254,7 +266,24 @@ namespace SimpleProxy
             }
             finally
             {
-                client.Close();
+                if (!keep)
+                {
+                    client.Close();
+                }
+
+                IList<int> clientList = null;
+                lock (hostMap)
+                {
+                    hostMap.TryGetValue(url.Host, out clientList);
+                    if (clientList != null)
+                    {
+                        clientList.Remove(client.GetHashCode());
+                        if(clientList.Count == 0)
+                        {
+                            hostMap.Remove(url.Host);
+                        }
+                    }
+                }
             }
         }
 
@@ -285,14 +314,12 @@ namespace SimpleProxy
             }
 
             // send response headers to client
-            using (var clientStreamWriter = new StreamWriter(clientStream))
-            {
-                clientStreamWriter.WriteLine("HTTP/1.0 200 Connection established");
-                clientStreamWriter.WriteLine(String.Format("Timestamp: {0}", DateTime.Now.ToString()));
-                clientStreamWriter.WriteLine("Proxy-agent: simple-proxy");
-                clientStreamWriter.WriteLine();
-                clientStreamWriter.Flush();
-            }
+            var clientStreamWriter = new StreamWriter(clientStream);
+            clientStreamWriter.WriteLine("HTTP/1.0 200 Connection established");
+            clientStreamWriter.WriteLine(String.Format("Timestamp: {0}", DateTime.Now.ToString()));
+            clientStreamWriter.WriteLine("Proxy-agent: simple-proxy");
+            clientStreamWriter.WriteLine();
+            clientStreamWriter.Flush();
 
             var tunnelStream = tunnelClient.GetStream();
 
@@ -399,7 +426,21 @@ namespace SimpleProxy
                                     writeTask.Wait();
                                 }
 #else
-                    tunnelStream.CopyToAsync(clientStream, BUFFER_SIZE).Wait();
+                    try
+                    {
+                        tunnelStream.CopyToAsync(clientStream, BUFFER_SIZE).Wait();
+                    }
+                    catch (AggregateException ae)
+                    {
+                        if (ae.InnerException is ObjectDisposedException)
+                        {
+                            // do nothing
+                        }
+                        else
+                        {
+                            throw ae.InnerException;
+                        }
+                    }
 #endif
                 }
                 catch (Exception ex)
@@ -428,7 +469,7 @@ namespace SimpleProxy
                     if (tunnelClient != null)
                     {
                         tunnelClient.Close();
-                    }        
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -440,7 +481,7 @@ namespace SimpleProxy
             Task.WaitAll(relayToServer);
 
             var closeByTimeoutTask = Task.Delay(5 * 1000, waitCancell.Token)
-                .ContinueWith((delay) => 
+                .ContinueWith((delay) =>
                 {
                     if (waitCancell.Token.IsCancellationRequested)
                     {

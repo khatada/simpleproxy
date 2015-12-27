@@ -11,14 +11,16 @@ namespace SimpleProxy
 {
     class HttpUtil
     {
-        private static readonly String[] colonSpaceSplit = new string[] { ": " };
+        private static readonly string[] colonSpaceSplit = new string[] { ": " };
         private static readonly char[] semiSplit = new char[] { ';' };
+        private static readonly char[] rangeSplit = new char[] { ',', '=' };
+        private static readonly char[] hyphenSplit = new char[] { '-' };
         private static readonly Regex cookieSplitRegEx = new Regex(@",(?! )");
 
         public class Headers : List<Tuple<string, string>>
         {
             public int getAsIntOrElse(string name, int elseValue){
-                var header = this.FirstOrDefault((h) => h.Item1 == name);
+                var header = this.FirstOrDefault((h) => h.Item1.ToLower() == name);
                 if (header == null)
                 {
                     return elseValue;
@@ -36,7 +38,7 @@ namespace SimpleProxy
 
             public string getAsStringOrElse(string name, string elseValue)
             {
-                var header = this.FirstOrDefault((h) => h.Item1 == name);
+                var header = this.FirstOrDefault((h) => h.Item1.ToLower() == name);
                 if (header == null)
                 {
                     return elseValue;
@@ -47,7 +49,7 @@ namespace SimpleProxy
 
             public DateTime getAsDateTimeOrElse(string name, DateTime elseValue)
             {
-                var header = this.FirstOrDefault((h) => h.Item1 == name);
+                var header = this.FirstOrDefault((h) => h.Item1.ToLower() == name);
                 if (header == null)
                 {
                     return elseValue;
@@ -97,7 +99,7 @@ namespace SimpleProxy
                         case "proxy-connection":
                             break;
                         case "connection":
-                            webRequest.Connection = header.Item2;
+                            // webRequest.Connection = header.Item2;
                             break;
                         case "keep-alive":
                             // webRequest.KeepAlive = bool.Parse(header.Item2);
@@ -117,6 +119,43 @@ namespace SimpleProxy
                             }  
                             break;
                         case "upgrade-insecure-requests":
+                            break;
+                        case "range":
+                            var rangeTok = header.Item2.Trim().Split(rangeSplit);
+                            for(var i=0; i<rangeTok.Length; i++)
+                            {
+                                if(i == 0)
+                                {
+                                    continue;
+                                }
+                                var tok = rangeTok[i].Trim().Split(hyphenSplit, StringSplitOptions.None);
+                                if(tok.Length == 2)
+                                {
+                                    int start, end;
+                                    if (string.IsNullOrEmpty(tok[0]))
+                                    {
+                                        if(int.TryParse(tok[1], out end))
+                                        {
+                                            webRequest.AddRange(-end);
+                                        }
+                                    }
+                                    else if (string.IsNullOrEmpty(tok[1]))
+                                    {
+                                        if (int.TryParse(tok[0], out start))
+                                        {
+                                            webRequest.AddRange(-start);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if (int.TryParse(tok[0], out start) && int.TryParse(tok[1], out end))
+                                        {
+                                            webRequest.AddRange(start, end);
+                                        }
+                                    }
+                                }
+                            }
+                            
                             break;
                         default:
                             try
@@ -181,76 +220,8 @@ namespace SimpleProxy
                     headers.Add(new Tuple<String, String>("Set-Cookie", cookie));
                 }
             }
-
-            // headers.Add(new Tuple<String, String>("X-Proxied-By", "matt-dot-net proxy"));
             
             return headers;
         }
-
-        #region not used
-        private static int ReadRequestHeaders(StreamReader sr, HttpWebRequest webReq)
-        {
-            String httpCmd = null;
-            int contentLen = 0;
-            do
-            {
-                httpCmd = sr.ReadLine();
-                if (String.IsNullOrEmpty(httpCmd))
-                {
-                    return contentLen;
-                }
-
-                String[] header = httpCmd.Split(colonSpaceSplit, 2, StringSplitOptions.None);
-                switch (header[0].ToLower())
-                {
-                    case "host":
-                        webReq.Host = header[1];
-                        break;
-                    case "user-agent":
-                        webReq.UserAgent = header[1];
-                        break;
-                    case "accept":
-                        webReq.Accept = header[1];
-                        break;
-                    case "referer":
-                        webReq.Referer = header[1];
-                        break;
-                    case "cookie":
-                        webReq.Headers["Cookie"] = header[1];
-                        break;
-                    case "proxy-connection":
-                    case "connection----":
-                    case "keep-alive":
-                        //ignore these
-                        break;
-                    case "content-length":
-                        int.TryParse(header[1], out contentLen);
-                        break;
-                    case "content-type":
-                        webReq.ContentType = header[1];
-                        break;
-                    case "if-modified-since":
-                        String[] sb = header[1].Trim().Split(semiSplit);
-                        DateTime d;
-                        if (DateTime.TryParse(sb[0], out d))
-                            webReq.IfModifiedSince = d;
-                        break;
-                    case "upgrade-insecure-requests":
-                        break;
-                    default:
-                        try
-                        {
-                            webReq.Headers.Add(header[0], header[1]);
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine(String.Format("Could not add header {0} : {1}.  Exception message:{2}", header[0], header[1], ex.Message));
-                        }
-                        break;
-                }
-            } while (!String.IsNullOrWhiteSpace(httpCmd));
-            return contentLen;
-        }
-        #endregion
     }
 }
