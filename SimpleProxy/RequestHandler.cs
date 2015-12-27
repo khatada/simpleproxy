@@ -23,7 +23,9 @@ namespace SimpleProxy
 
         public static void processHttp(TcpClient client)
         {
-            bool keep = false;
+            var handle = client.Client.Handle;
+            System.Console.WriteLine("Socket: " + handle.ToString());
+            
             var clientStream = client.GetStream();
             var clientStreamReader = new StreamReader(clientStream);
 
@@ -38,7 +40,6 @@ namespace SimpleProxy
             var splitBuffer = httpCmd.Split(spaceSplit, 3);
             var method = splitBuffer[0].ToUpper();
             var remoteUri = splitBuffer[1];
-            var version = new Version(1, 1);
 
             if (method == "CONNECT")
             {
@@ -55,12 +56,48 @@ namespace SimpleProxy
 
                 return;
             }
+            else
+            {
+                try
+                {
+                    HandleCmd(client, clientStream, clientStreamReader, httpCmd);
+                }
+                finally
+                {
+                    clientStreamReader.Dispose();
+                    clientStream.Dispose();
+                    client.Close();
+                }
+
+                return;
+            }
+
+            
+        }
+
+        private static void HandleCmd(TcpClient client, Stream clientStream, StreamReader clientStreamReader, string httpCmd)
+        {
+            var splitBuffer = httpCmd.Split(spaceSplit, 3);
+            var method = splitBuffer[0].ToUpper();
+            var remoteUri = splitBuffer[1];
+            var version = new Version(1, 1);
 
             // read request header
+            bool keepConnection = false;
+            bool keepAlive = false;
             var requestHeaders = HttpUtil.ReadHeaders(clientStreamReader);
             var contentLength = requestHeaders.getAsIntOrElse("content-length", 0);
 
+            var proxyConnection = requestHeaders.getAsStringOrElse("proxy-connection", "");
+            if(proxyConnection.ToLower() == "keep-alive")
+            {
+                keepAlive = true;
+            }
+
             var url = new Uri(remoteUri);
+            HttpWebResponse response = null;
+            StreamWriter responseWriter = null;
+            Stream responseStream = null;
 
             try
             {
@@ -75,7 +112,7 @@ namespace SimpleProxy
                     }
                     clientList.Add(client.GetHashCode());
 
-                    foreach(var tuple in hostMap)
+                    foreach (var tuple in hostMap)
                     {
                         System.Console.WriteLine(string.Format("{0} : {1}", tuple.Value.Count, tuple.Key));
                     }
@@ -92,14 +129,16 @@ namespace SimpleProxy
                 webRequest.Method = method;
                 webRequest.ProtocolVersion = version;
                 webRequest.Proxy = null;
-                webRequest.KeepAlive = true;
+                webRequest.KeepAlive = keepAlive;
+                System.Console.WriteLine("Request Connection KeepAlive: " + keepAlive.ToString());
                 webRequest.AllowAutoRedirect = false;
                 webRequest.AutomaticDecompression = DecompressionMethods.None;
-                webRequest.Timeout = 15000;
+                webRequest.Timeout = 10000;
+                webRequest.ReadWriteTimeout = 10000;
 
                 if (method == "GET")
                 {
-
+                    // do nothing
                 }
                 else if (method == "POST")
                 {
@@ -133,7 +172,7 @@ namespace SimpleProxy
                     System.Console.WriteLine("Unrecognized method " + method.ToUpper());
                 }
 
-                HttpWebResponse response = null;
+                
                 try
                 {
                     response = (HttpWebResponse)webRequest.GetResponse();
@@ -162,16 +201,17 @@ namespace SimpleProxy
                 var responseConnection = responseHeaders.getAsStringOrElse("connection", "");
                 if (responseConnection.ToLower() == "keep-alive")
                 {
-                    keep = true;
+                    keepConnection = true;
                 }
+                System.Console.WriteLine("Connection " + responseConnection + " " + keepConnection.ToString());
 
                 // System.Console.WriteLine(responseHeaders.Print());
-                
-                var responseStream = response.GetResponseStream();
+
+                responseStream = response.GetResponseStream();
 
                 Task writeTask = null;
                 // When StreamWriter is closed, clientStream is also closed.
-                StreamWriter responseWriter = null;
+                
                 //send the response status and response headers
                 try
                 {
@@ -244,22 +284,6 @@ namespace SimpleProxy
                 {
                     serverWriteTask.Wait();
                 }
-
-                try
-                {
-                    clientStream.Flush();
-                    responseStream.Close();
-                    response.Close();
-                    response.Dispose();
-                    responseWriter.Close();
-                    clientStream.Close();
-
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine("Error in closing connection");
-                    Console.WriteLine(ex.Message);
-                }
             }
             catch (Exception ex)
             {
@@ -268,9 +292,28 @@ namespace SimpleProxy
             }
             finally
             {
-                if (!keep)
+                try
                 {
-                    client.Close();
+                    if (responseWriter != null)
+                    {
+                        responseWriter.Flush();
+                    }
+                    clientStream.Flush();
+                    if (responseStream != null)
+                    {
+                        responseStream.Close();
+                        responseStream.Dispose();
+                    }
+                    if (response != null)
+                    {
+                        response.Close();
+                        response.Dispose();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Error in closing connection");
+                    Console.WriteLine(ex.Message);
                 }
 
                 IList<int> clientList = null;
@@ -280,10 +323,20 @@ namespace SimpleProxy
                     if (clientList != null)
                     {
                         clientList.Remove(client.GetHashCode());
-                        if(clientList.Count == 0)
+                        if (clientList.Count == 0)
                         {
                             hostMap.Remove(url.Host);
                         }
+                    }
+                }
+
+                if (keepConnection)
+                {
+                    var nexthttpCmd = clientStreamReader.ReadLine();
+                    System.Console.WriteLine("next: " + nexthttpCmd);
+                    if (!string.IsNullOrEmpty(nexthttpCmd))
+                    {
+                        HandleCmd(client, clientStream, clientStreamReader, nexthttpCmd);
                     }
                 }
             }
