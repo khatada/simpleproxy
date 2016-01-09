@@ -134,19 +134,15 @@ namespace SimpleProxy
 
         private static void ProcessClient(Object obj)
         {
-            ProxyClient client = (ProxyClient)obj;
             try
             {
+                ProxyClient client = (ProxyClient)obj;
                 RequestHandler.processHttp(client.tcpClient);
             }
             catch (Exception ex)
             {
                 Console.WriteLine("Unhandled Exception");
                 Console.WriteLine(ex.Message);
-            }
-            finally
-            {
-                client.tcpClient.Close();
             }
         }
 

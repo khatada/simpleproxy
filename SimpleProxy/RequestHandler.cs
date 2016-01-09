@@ -21,7 +21,7 @@ namespace SimpleProxy
 
         public static IDictionary<string, IList<int>> hostMap = new Dictionary<string, IList<int>>();
 
-        public static void processHttp(TcpClient client)
+        public static async void processHttp(TcpClient client)
         {
             var handle = client.Client.Handle;
             // System.Console.WriteLine("Socket: " + handle.ToString());
@@ -34,6 +34,7 @@ namespace SimpleProxy
             {
                 clientStreamReader.Close();
                 clientStream.Close();
+                client.Close();
                 return;
             }
 
@@ -45,7 +46,7 @@ namespace SimpleProxy
             {
                 try
                 {
-                    HandleConnectCmd(client, clientStream, clientStreamReader, remoteUri);
+                    await HandleConnectCmd(client, clientStream, clientStreamReader, remoteUri);
                 }
                 catch
                 {
@@ -64,7 +65,7 @@ namespace SimpleProxy
             {
                 try
                 {
-                    HandleCmd(client, clientStream, clientStreamReader, httpCmd);
+                    await HandleCmd(client, clientStream, clientStreamReader, httpCmd);
                 }
                 catch
                 {
@@ -79,11 +80,132 @@ namespace SimpleProxy
 
                 return;
             }
-
-            
         }
 
-        private static void HandleCmd(TcpClient client, Stream clientStream, StreamReader clientStreamReader, string httpCmd)
+        private static async Task<HttpWebRequest> CreateRequest(string remoteUri, string method, StreamReader clientStreamReader, HttpUtil.Headers requestHeaders)
+        {
+            var keepAlive = false;
+            var proxyConnection = requestHeaders.getAsStringOrElse("proxy-connection", "");
+            if (proxyConnection.ToLower() == "keep-alive")
+            {
+                keepAlive = true;
+            }
+            var contentLength = requestHeaders.getAsIntOrElse("content-length", 0);
+
+            var webRequest = (HttpWebRequest)HttpWebRequest.Create(remoteUri);
+            requestHeaders.ApplyTo(webRequest);
+
+            // override headers
+            webRequest.Method = method;
+            webRequest.ProtocolVersion = new Version(1, 1);
+            webRequest.Proxy = null;
+            webRequest.KeepAlive = keepAlive;
+            webRequest.AllowAutoRedirect = false;
+            webRequest.AutomaticDecompression = DecompressionMethods.None;
+            webRequest.Timeout = 10000;
+            webRequest.ReadWriteTimeout = 10000;
+
+            if (method == "POST" || method == "PUT")
+            {
+                var postBuffer = new char[contentLength];
+                int total = 0;
+                var requestBuffererdStream = new BufferedStream(webRequest.GetRequestStream());
+                var requestWriter = new StreamWriter(requestBuffererdStream);
+
+                while (true)
+                {
+                    if (total >= contentLength)
+                    {
+                        break;
+                    }
+
+                    // clientStream.Read does not read data and blocks forever
+                    //var count = clientStream.Read(postBuffer, 0, contentLength);
+                    var count = clientStreamReader.ReadBlock(postBuffer, 0, contentLength);
+                    if (count <= 0)
+                    {
+                        break;
+                    }
+
+                    total += count;
+                    requestWriter.Write(postBuffer, 0, count);
+                }
+                requestWriter.Flush();
+                await requestBuffererdStream.FlushAsync();
+            }
+
+            return webRequest;
+
+        }
+
+        private static async Task SendResponseToClient(HttpStatusCode statusCode, string statusDescription,int contentLength, Stream responseStream,HttpUtil.Headers responseHeaders , Stream clientStream, StreamReader clientStreamReader)
+        {
+            StreamWriter responseWriter = null;
+            var bufferedStream = new BufferedStream(clientStream);
+
+            var transferEncoding = responseHeaders.getAsStringOrElse("Transfer-Encoding", "").ToLower();
+
+            try
+            {
+                responseWriter = new StreamWriter(bufferedStream);
+                var status = string.Format("HTTP/1.1 {0} {1}", (Int32)statusCode, statusDescription);
+                responseWriter.WriteLine(status);
+
+                foreach (var header in responseHeaders)
+                {
+                    responseWriter.WriteLine(String.Format("{0}: {1}", header.Item1, header.Item2));
+                }
+                responseWriter.WriteLine();
+                responseWriter.Flush();
+                await bufferedStream.FlushAsync();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Error in writing headers");
+                Console.WriteLine(ex.Message);
+            }
+
+            Byte[] buffer;
+            if (contentLength > 0)
+            {
+                try
+                {
+                    responseStream.CopyTo(bufferedStream, BUFFER_SIZE);
+                    await bufferedStream.FlushAsync();
+                }
+                catch (Exception ex)
+                {
+                    System.Console.WriteLine("Error while send response to client\r\n" + ex.Message);
+                }
+            }
+            else if(transferEncoding == "chunked")
+            {
+                // chunked encoding
+                buffer = new Byte[BUFFER_SIZE];
+                while (true)
+                {
+                    var count = await responseStream.ReadAsync(buffer, 0, BUFFER_SIZE);
+                    if (count > 0)
+                    {
+                        var chunkHead = Encoding.ASCII.GetBytes(count.ToString("x2"));
+
+                        bufferedStream.Write(chunkHead, 0, chunkHead.Length);
+                        bufferedStream.Write(chunkTrail, 0, chunkTrail.Length);
+                        bufferedStream.Write(buffer, 0, count);
+                        bufferedStream.Write(chunkTrail, 0, chunkTrail.Length);
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+
+                bufferedStream.Write(chunkEnd, 0, chunkEnd.Length);
+                await bufferedStream.FlushAsync();
+            }
+        }
+
+        private static async Task HandleCmd(TcpClient client, Stream clientStream, StreamReader clientStreamReader, string httpCmd)
         {
             var splitBuffer = httpCmd.Split(spaceSplit, 3);
             var method = splitBuffer[0].ToUpper();
@@ -92,98 +214,20 @@ namespace SimpleProxy
 
             // read request header
             bool keepConnection = false;
-            bool keepAlive = false;
             var requestHeaders = HttpUtil.ReadHeaders(clientStreamReader);
             var contentLength = requestHeaders.getAsIntOrElse("content-length", 0);
 
-            var proxyConnection = requestHeaders.getAsStringOrElse("proxy-connection", "");
-            if(proxyConnection.ToLower() == "keep-alive")
-            {
-                keepAlive = true;
-            }
-
-            var url = new Uri(remoteUri);
             HttpWebResponse response = null;
-            StreamWriter responseWriter = null;
+            
             Stream responseStream = null;
 
             try
             {
-                IList<int> clientList = null;
-                lock (hostMap)
-                {
-                    hostMap.TryGetValue(url.Host, out clientList);
-                    if (clientList == null)
-                    {
-                        clientList = new List<int>();
-                        hostMap.Add(url.Host, clientList);
-                    }
-                    clientList.Add(client.GetHashCode());
-
-                    foreach (var tuple in hostMap)
-                    {
-                        // System.Console.WriteLine(string.Format("{0} : {1}", tuple.Value.Count, tuple.Key));
-                    }
-                }
-
-                // System.Console.WriteLine(httpCmd);
-                // System.Console.WriteLine(requestHeaders.Print());
-
-
-                var webRequest = (HttpWebRequest)HttpWebRequest.Create(remoteUri);
-                requestHeaders.ApplyTo(webRequest);
-
-                // override headers
-                webRequest.Method = method;
-                webRequest.ProtocolVersion = version;
-                webRequest.Proxy = null;
-                webRequest.KeepAlive = keepAlive;
-                // System.Console.WriteLine("Request Connection KeepAlive: " + keepAlive.ToString());
-                webRequest.AllowAutoRedirect = false;
-                webRequest.AutomaticDecompression = DecompressionMethods.None;
-                webRequest.Timeout = 10000;
-                webRequest.ReadWriteTimeout = 10000;
-
-                if (method == "GET")
-                {
-                    // do nothing
-                }
-                else if (method == "POST")
-                {
-                    var postBuffer = new char[contentLength];
-                    int total = 0;
-                    var requestWriter = new StreamWriter(webRequest.GetRequestStream());
-
-                    while (true)
-                    {
-                        if (total >= contentLength)
-                        {
-                            break;
-                        }
-
-                        // clientStream.Read does not read data and blocks forever
-                        //var count = clientStream.Read(postBuffer, 0, contentLength);
-                        var count = clientStreamReader.ReadBlock(postBuffer, 0, contentLength);
-                        if (count <= 0)
-                        {
-                            break;
-                        }
-
-                        total += count;
-                        requestWriter.Write(postBuffer, 0, count);
-                    }
-                    requestWriter.Flush();
-                }
-                else
-                {
-                    System.Console.WriteLine("Error while reuqest to " + remoteUri);
-                    System.Console.WriteLine("Unrecognized method " + method.ToUpper());
-                }
-
+                var webRequest = await CreateRequest(remoteUri, method, clientStreamReader, requestHeaders);
                 
                 try
                 {
-                    response = (HttpWebResponse)webRequest.GetResponse();
+                    response = (HttpWebResponse)(await webRequest.GetResponseAsync());
                 }
                 catch (WebException webEx)
                 {
@@ -197,9 +241,6 @@ namespace SimpleProxy
 
                 if (response == null)
                 {
-                    clientStreamReader.Dispose();
-                    clientStream.Dispose();
-                    client.Close();
                     return;
                 }
 
@@ -207,149 +248,67 @@ namespace SimpleProxy
                 responseHeaders.Add(new Tuple<string, string>("X-Proxied-By", "simple-proxy"));
 
                 var responseConnection = responseHeaders.getAsStringOrElse("connection", "");
-                if (responseConnection.ToLower() == "keep-alive")
+                if (responseConnection.ToLower() != "close")
                 {
                     keepConnection = true;
                 }
-                // System.Console.WriteLine("Connection " + responseConnection + " " + keepConnection.ToString());
-                // System.Console.WriteLine(responseHeaders.Print());
 
                 responseStream = response.GetResponseStream();
+                await SendResponseToClient(response.StatusCode, response.StatusDescription, (int)response.ContentLength, responseStream, responseHeaders, clientStream, clientStreamReader);
 
-                Task writeTask = null;
-                // When StreamWriter is closed, clientStream is also closed.
-                
-                //send the response status and response headers
-                try
+                if (responseStream != null)
                 {
-                    responseWriter = new StreamWriter(clientStream);
-                    var status = string.Format("HTTP/1.1 {0} {1}", (Int32)response.StatusCode, response.StatusDescription);
-                    responseWriter.WriteLine(status);
-                    // System.Console.WriteLine(status);
-
-                    foreach (var header in responseHeaders)
-                    {
-                        responseWriter.WriteLine(String.Format("{0}: {1}", header.Item1, header.Item2));
-                    }
-                    responseWriter.WriteLine();
-                    responseWriter.Flush();
+                    responseStream.Close();
+                    responseStream.Dispose();
                 }
-                catch (Exception ex)
+                if (response != null)
                 {
-                    Console.WriteLine("Error in writing headers");
-                    Console.WriteLine(ex.Message);
+                    response.Close();
+                    response.Dispose();
                 }
 
-                Task serverWriteTask = null;
-
-
-                Byte[] buffer;
-                if (response.ContentLength > 0)
-                {
-                    try
-                    {
-                        writeTask = responseStream.CopyToAsync(clientStream, BUFFER_SIZE);
-                    }
-                    catch (Exception ex)
-                    {
-                        System.Console.WriteLine("Error while send response to client\r\n" + ex.Message);
-                    }
-                }
-                else
-                {
-                    // chunked encoding
-                    buffer = new Byte[BUFFER_SIZE];
-                    while (true)
-                    {
-                        var readTask = responseStream.ReadAsync(buffer, 0, BUFFER_SIZE);
-                        readTask.Wait();
-                        var count = readTask.Result;
-                        if (count > 0)
-                        {
-                            var chunkHead = Encoding.ASCII.GetBytes(count.ToString("x2"));
-
-                            clientStream.WriteAsync(chunkHead, 0, chunkHead.Length);
-                            clientStream.WriteAsync(chunkTrail, 0, chunkTrail.Length);
-                            clientStream.WriteAsync(buffer, 0, count);
-                            clientStream.WriteAsync(chunkTrail, 0, chunkTrail.Length);
-                        }
-                        else
-                        {
-                            break;
-                        }
-                    }
-
-                    writeTask = clientStream.WriteAsync(chunkEnd, 0, chunkEnd.Length);
-                }
-
-                if (writeTask != null && !writeTask.IsCompleted)
-                {
-                    writeTask.Wait();
-                }
-
-                if (serverWriteTask != null && !serverWriteTask.IsCompleted)
-                {
-                    serverWriteTask.Wait();
-                }
             }
             catch (Exception ex)
             {
                 Console.WriteLine("Error while sending response");
                 Console.WriteLine(ex.Message);
             }
-            finally
+
+            try
             {
-                try
-                {
-                    if (responseWriter != null)
-                    {
-                        responseWriter.Flush();
-                    }
-                    clientStream.Flush();
-                    if (responseStream != null)
-                    {
-                        responseStream.Close();
-                        responseStream.Dispose();
-                    }
-                    if (response != null)
-                    {
-                        response.Close();
-                        response.Dispose();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine("Error in closing connection");
-                    Console.WriteLine(ex.Message);
-                }
-
-                IList<int> clientList = null;
-                lock (hostMap)
-                {
-                    hostMap.TryGetValue(url.Host, out clientList);
-                    if (clientList != null)
-                    {
-                        clientList.Remove(client.GetHashCode());
-                        if (clientList.Count == 0)
-                        {
-                            hostMap.Remove(url.Host);
-                        }
-                    }
-                }
-
                 if (keepConnection)
                 {
-                    var nexthttpCmd = clientStreamReader.ReadLine();
-                    // System.Console.WriteLine("next: " + nexthttpCmd);
-                    if (!string.IsNullOrEmpty(nexthttpCmd))
+                    var nexthttpCmdTask = clientStreamReader.ReadLineAsync();
+                    var task = await Task.WhenAny(nexthttpCmdTask, Task.Delay(2000));
+                    if (task == nexthttpCmdTask)
                     {
-                        HandleCmd(client, clientStream, clientStreamReader, nexthttpCmd);
+                        var nexthttpCmd = nexthttpCmdTask.Result;
+                        // System.Console.WriteLine("next: " + nexthttpCmd);
+                        if (!string.IsNullOrEmpty(nexthttpCmd))
+                        {
+                            await HandleCmd(client, clientStream, clientStreamReader, nexthttpCmd);
+                        }
                     }
+                    else
+                    {
+                        System.Console.WriteLine("Close Connection by Timeout of 2000msec");
+                    }
+
+                }
+                else
+                {
+                    System.Console.WriteLine("Close Connection");
                 }
             }
+            catch(Exception ex)
+            {
+                System.Console.WriteLine("Erro while keep connection");
+                System.Console.WriteLine(ex.Message);
+            }
+            
         }
 
-        private static void HandleConnectCmd(TcpClient client, Stream clientStream, StreamReader clientStreamReader, string uri)
+        private static async Task HandleConnectCmd(TcpClient client, Stream clientStream, StreamReader clientStreamReader, string uri)
         {
             var remoteUri = "https://" + uri;
 
@@ -380,170 +339,20 @@ namespace SimpleProxy
             clientStreamWriter.WriteLine("HTTP/1.0 200 Connection established");
             clientStreamWriter.WriteLine(String.Format("Timestamp: {0}", DateTime.Now.ToString()));
             clientStreamWriter.WriteLine("Proxy-agent: simple-proxy");
+            clientStreamWriter.WriteLine("Connection: close");
             clientStreamWriter.WriteLine();
-            clientStreamWriter.Flush();
+            await clientStreamWriter.FlushAsync();
 
             var tunnelStream = tunnelClient.GetStream();
 
             // System.Console.WriteLine("tunnel start");
-            var relayToServer = Task.Factory.StartNew(() =>
+            try
             {
-                try
-                {
-#if MANUAL_TUNNEL
-                                var loopCancel = new CancellationTokenSource();
-                                Task writeTask = null;
-                                while (true)
-                                {
-                                    if (loopCancel.Token.IsCancellationRequested)
-                                    {
-                                        break;
-                                    }
+                var relayToServer = clientStream.CopyToAsync(tunnelStream, BUFFER_SIZE);
+                var relayToClient = tunnelStream.CopyToAsync(clientStream, BUFFER_SIZE);
 
-                                    var buffer = new byte[BUFFER_SIZE];
-                                    var readTask = clientStream.ReadAsync(buffer, 0, BUFFER_SIZE);
-                                    try
-                                    {
-                                        readTask.Wait();
-                                    }
-                                    catch
-                                    {
-                                        break;
-                                    }
-                                    
-
-                                    var count = readTask.Result;
-                                    if (count > 0)
-                                    {
-                                        System.Console.WriteLine("tunnel to " + host + " " + count.ToString() + "bytes");
-                                        writeTask = tunnelStream.WriteAsync(buffer, 0, count);
-                                    }
-                                    else
-                                    {
-                                        loopCancel.Cancel();
-                                        System.Console.WriteLine("tunnel to " + host + " ends");
-                                        break;
-                                    }
-
-                                }
-
-                                if (writeTask != null && !writeTask.IsCompleted)
-                                {
-                                    writeTask.Wait();
-                                }
-#else
-                    clientStream.CopyToAsync(tunnelStream, BUFFER_SIZE).Wait();
-#endif
-                }
-                catch (Exception ex)
-                {
-                    System.Console.WriteLine("Error while tunneling to " + host);
-                    System.Console.WriteLine(ex.Message);
-                }
-            });
-
-
-            var relayToClient = Task.Factory.StartNew(() =>
-            {
-                try
-                {
-#if MANUAL_TUNNEL
-                                var loopCancel = new CancellationTokenSource();
-                                Task writeTask = null;
-                                while (true)
-                                {
-                                    if (loopCancel.Token.IsCancellationRequested)
-                                    {
-                                        break;
-                                    }
-
-                                    var buffer = new byte[BUFFER_SIZE];
-                                    var readTask = tunnelStream.ReadAsync(buffer, 0, BUFFER_SIZE);
-                                    try
-                                    {
-                                        readTask.Wait();
-                                    }
-                                    catch
-                                    {
-                                        break;
-                                    }
-
-                                    var count = readTask.Result;
-                                    if (count > 0)
-                                    {
-                                        System.Console.WriteLine("tunnel from " + host + " " + count.ToString() + "bytes");
-                                        writeTask = clientStream.WriteAsync(buffer, 0, count);
-                                    }
-                                    else
-                                    {
-                                        loopCancel.Cancel();
-                                        System.Console.WriteLine("tunnel from " + host + " ends");
-                                        break;
-                                    }
-
-                                }
-
-                                if(writeTask != null && !writeTask.IsCompleted)
-                                {
-                                    writeTask.Wait();
-                                }
-#else
-                    try
-                    {
-                        tunnelStream.CopyToAsync(clientStream, BUFFER_SIZE).Wait();
-                    }
-                    catch (AggregateException ae)
-                    {
-                        if (ae.InnerException is ObjectDisposedException)
-                        {
-                            // do nothing
-                        }
-                        else
-                        {
-                            throw ae.InnerException;
-                        }
-                    }
-#endif
-                }
-                catch (Exception ex)
-                {
-                    System.Console.WriteLine("Error while tunneling from " + host);
-                    System.Console.WriteLine(ex.Message);
-                }
-            });
-
-            var waitCancell = new CancellationTokenSource();
-            var closeFromClientTask = relayToClient.ContinueWith((t) =>
-            {
-                if (waitCancell.Token.IsCancellationRequested)
-                {
-                    return;
-                }
-                waitCancell.Cancel();
-
-                // System.Console.WriteLine("tunnel close (by client close) " + host);
-                try
-                {
-                    if (tunnelStream != null)
-                    {
-                        tunnelStream.Dispose();
-                    }
-                    if (tunnelClient != null)
-                    {
-                        tunnelClient.Close();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    System.Console.WriteLine("Error while closing connection");
-                    System.Console.WriteLine(ex.Message);
-                }
-            }, waitCancell.Token);
-
-            Task.WaitAll(relayToServer);
-
-            var closeByTimeoutTask = Task.Delay(5 * 1000, waitCancell.Token)
-                .ContinueWith((delay) =>
+                var waitCancell = new CancellationTokenSource();
+                var closeFromClientTask = relayToClient.ContinueWith((t) =>
                 {
                     if (waitCancell.Token.IsCancellationRequested)
                     {
@@ -551,8 +360,7 @@ namespace SimpleProxy
                     }
                     waitCancell.Cancel();
 
-                    // System.Console.WriteLine("tunnel close (by timeout) " + host);
-
+                    // System.Console.WriteLine("tunnel close (by client close) " + host);
                     try
                     {
                         if (tunnelStream != null)
@@ -569,9 +377,46 @@ namespace SimpleProxy
                         System.Console.WriteLine("Error while closing connection");
                         System.Console.WriteLine(ex.Message);
                     }
-                });
+                }, waitCancell.Token);
 
-            Task.WaitAny(closeFromClientTask, closeByTimeoutTask);
+                await relayToServer;
+
+                var closeByTimeoutTask = Task.Delay(5 * 1000, waitCancell.Token)
+                    .ContinueWith((delay) =>
+                    {
+                        if (waitCancell.Token.IsCancellationRequested)
+                        {
+                            return;
+                        }
+                        waitCancell.Cancel();
+
+                        // System.Console.WriteLine("tunnel close (by timeout) " + host);
+
+                        try
+                        {
+                            if (tunnelStream != null)
+                            {
+                                tunnelStream.Dispose();
+                            }
+                            if (tunnelClient != null)
+                            {
+                                tunnelClient.Close();
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            System.Console.WriteLine("Error while closing connection");
+                            System.Console.WriteLine(ex.Message);
+                        }
+                    });
+
+                await Task.WhenAny(closeFromClientTask, closeByTimeoutTask);
+
+            }
+            catch(Exception ex)
+            {
+                System.Console.WriteLine(ex.Message);
+            }
 
         }
     }

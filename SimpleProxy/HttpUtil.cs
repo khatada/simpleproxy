@@ -20,7 +20,7 @@ namespace SimpleProxy
         public class Headers : List<Tuple<string, string>>
         {
             public int getAsIntOrElse(string name, int elseValue){
-                var header = this.FirstOrDefault((h) => h.Item1.ToLower() == name);
+                var header = this.FirstOrDefault((h) => h.Item1.ToLower() == name.ToLower());
                 if (header == null)
                 {
                     return elseValue;
@@ -38,7 +38,7 @@ namespace SimpleProxy
 
             public string getAsStringOrElse(string name, string elseValue)
             {
-                var header = this.FirstOrDefault((h) => h.Item1.ToLower() == name);
+                var header = this.FirstOrDefault((h) => h.Item1.ToLower() == name.ToLower());
                 if (header == null)
                 {
                     return elseValue;
@@ -49,7 +49,7 @@ namespace SimpleProxy
 
             public DateTime getAsDateTimeOrElse(string name, DateTime elseValue)
             {
-                var header = this.FirstOrDefault((h) => h.Item1.ToLower() == name);
+                var header = this.FirstOrDefault((h) => h.Item1.ToLower() == name.ToLower());
                 if (header == null)
                 {
                     return elseValue;
